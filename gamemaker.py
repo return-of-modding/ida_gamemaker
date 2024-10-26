@@ -141,19 +141,23 @@ class CleanupVisitor(ida_hexrays.ctree_parentee_t):
     def clean_up(self, tree, parent):  # type: (...) -> None
         ida_hexrays.ctree_parentee_t.apply_to(self, tree, parent)
 
-    def visit_insn(self, c):  # type: (...) -> int
-        if c.op == ida_hexrays.cit_block:
+    def visit_insn(self, insn):  # type: (...) -> int
+        if insn.op == ida_hexrays.cit_block:
             # This is pretty inefficient, but unfortunately we cannot traverse the list
             # and call erase() at the same time.
             # Manually traversing the list with begin(), end() and next() is bugged and throws
             # us in an infinite loop.
             # Trying to mutate the list while iterating over it is a sure way to cause crashes.
+
             to_delete = []
-            for ins in c.cblock:
+
+            for ins in insn.cblock:
                 if ins.op == ida_hexrays.cit_empty:
                     to_delete.append(ins)
+
             for ins in to_delete:
-                c.cblock.remove(ins)
+                insn.cblock.remove(ins)
+
         return 0
 
 
@@ -169,22 +173,100 @@ def print_swig_object_vars(obj):
             print(f"{attr} = <unreadable attribute: {e}>")
 
 
+class DebugVisitor(ida_hexrays.ctree_parentee_t):
+    """A visitor that just prints information about the ctree."""
+
+    def visit(self, tree, parent):  # type: (...) -> None
+        ida_hexrays.ctree_parentee_t.apply_to(self, tree, parent)
+
+    def visit_insn(self, c):  # type: (...) -> int
+        print("DEBUG: insn 0x%016lx: %s" % (c.ea, c.opname))
+        return 0
+
+    def visit_expr(self, c):  # type: (...) -> int
+        print(
+            "DEBUG: expr 0x%016lx: %s - type: %s %s"
+            % (
+                c.ea,
+                c.opname,
+                str(c.type),
+                idaapi.get_name(c.obj_ea) if c.opname == "obj" else "",
+            )
+        )
+        if c.op == ida_hexrays.cot_call:
+            print("  a.functype: %s" % (str(c.a.functype)))
+            print(
+                "  x.ea: 0x%016lx - x.type: %s - x.op: %s"
+                % (c.x.ea, str(c.x.type), c.x.opname)
+            )
+            for i, a in enumerate(c.a):
+                print(
+                    "  arg[%d]: ea: 0x%016lx - type: %s - op: %s %s"
+                    % (
+                        i,
+                        a.ea,
+                        str(a.type),
+                        a.opname,
+                        idaapi.get_name(a.obj_ea) if a.opname == "obj" else "",
+                    )
+                )
+        return 0
+
+
 class CToGMLVisitor(ida_hexrays.ctree_visitor_t):
     """A visitor that makes the hexray pseudo c decompilation output more like the original GML."""
 
-    def __init__(self):
+    def __init__(self, cfunc):
         ida_hexrays.ctree_visitor_t.__init__(self, ida_hexrays.CV_INSNS)
 
+        self.cfunc = cfunc
         self.modified = False
 
     def visit_insn(self, insn):
         if self.remove_vector_rvalue_reset_or_free_call(insn):
             return 0
 
-        if self.remove_free_rvalue_call(insn):
+        if self.remove_noisy_function_calls(insn):
+            return 0
+
+        if self.simplify_rvalue_set_from_function(insn):
+            return 0
+
+        if self.remove_if_checks_related_to_arg_count(insn):
             return 0
 
         return 0
+
+    def simplify_rvalue_set_from_function(self, insn):
+        return False
+
+    def remove_if_checks_related_to_arg_count(self, insn):
+        changed = False
+
+        try:
+            if insn.op == ida_hexrays.cit_if:
+                if_stmt = insn.cif
+                then_branch = if_stmt.ithen
+                else_branch = if_stmt.ielse
+
+                if (
+                    then_branch
+                    and else_branch
+                    # if ( v11 <= 2 )
+                    #     v16 = &rvalue_array;
+                    #   else
+                    #     v16 = *(v10 + 2);
+                    and idaapi.get_name(then_branch.cblock[0].cexpr.y.x.obj_ea)
+                    == "rvalue_array"
+                ):
+                    # print_swig_object_vars(then_branch.cblock[0].cexpr.y.x)
+                    # print(idaapi.get_name(then_branch.cblock[0].cexpr.y.x.obj_ea))
+                    insn.replace_by(if_stmt.ielse)
+                    changed = True
+        except Exception as _:
+            pass
+
+        return changed
 
     def remove_insn(self, insn):
         insn.cleanup()
@@ -204,8 +286,8 @@ class CToGMLVisitor(ida_hexrays.ctree_visitor_t):
 
         return False
 
-    def remove_free_rvalue_call(self, insn):
-        removed_some_free_rvalue_call = False
+    def remove_noisy_function_calls(self, insn):
+        changed = False
 
         if insn.op == ida_hexrays.cit_if:
             if_statement = insn.cif
@@ -217,23 +299,25 @@ class CToGMLVisitor(ida_hexrays.ctree_visitor_t):
                 if stmt.op == ida_hexrays.cit_expr:
                     expr = stmt.cexpr
                     if expr.op == ida_hexrays.cot_call:
-                        print(idaapi.get_name(expr.x.obj_ea))
+                        # print(idaapi.get_name(expr.x.obj_ea))
                         func_name = idaapi.get_name(expr.x.obj_ea)
                         if func_name == "FREE_RValue_Pre":
                             self.remove_insn(stmt)
                             instruction_count_inside_block -= 1
-                            removed_some_free_rvalue_call = True
+                            changed = True
 
             if instruction_count_inside_block <= 0:
                 self.remove_insn(insn)
 
-        return removed_some_free_rvalue_call
+        return changed
 
 
 def clean_gml_decompilation():
     vu = ida_hexrays.get_widget_vdui(ida_kernwin.get_current_viewer())
 
-    v = CToGMLVisitor()
+    # DebugVisitor().apply_to(vu.cfunc.body, None)
+    # return
+    v = CToGMLVisitor(vu.cfunc)
     v.apply_to(vu.cfunc.body, None)
 
     # If any modifications were made, refresh the decompilation view
