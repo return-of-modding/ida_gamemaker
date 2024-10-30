@@ -135,6 +135,29 @@ def create_dummy_hexrays_insn():
     return res
 
 
+def make_helper_insn(ea, name):
+    return make_cexpr_insn(ea, make_helper_expr(name))
+
+
+def make_cexpr_insn(ea, obj):
+    insn = ida_hexrays.cinsn_t()
+    insn.ea = ea
+    insn.op = ida_hexrays.cit_expr
+    insn.cexpr = obj
+    insn.thisown = False
+    return insn
+
+
+def make_helper_expr(name, typ=False):
+    obj = ida_hexrays.cexpr_t()
+    obj.op = ida_hexrays.cot_helper
+    obj.exflags |= ida_hexrays.EXFL_ALONE
+    obj.helper = name
+    if typ is not False:
+        obj.type = typ
+    return obj
+
+
 class CleanupVisitor(ida_hexrays.ctree_parentee_t):
     """A visitor that cleans up the ctree by removing cit_empty items."""
 
@@ -213,84 +236,502 @@ class DebugVisitor(ida_hexrays.ctree_parentee_t):
         return 0
 
 
+def get_tinfo(name) -> idaapi.tinfo_t:
+    tif = idaapi.tinfo_t()
+    assert tif.get_named_type(idaapi.get_idati(), name)
+    return tif.copy()
+
+
+def get_ptr_tinfo(name) -> idaapi.tinfo_t:
+    res = idaapi.tinfo_t()
+    res.create_ptr(get_tinfo(name))
+    return res
+
+
+def get_array_tinfo(name, size) -> idaapi.tinfo_t:
+    res = idaapi.tinfo_t()
+    res.create_array(get_tinfo(name), 0, size)
+    return res
+
+
+def get_ptr_array_tinfo(name, size) -> idaapi.tinfo_t:
+    res = idaapi.tinfo_t()
+    res.create_array(get_ptr_tinfo(name), 0, size)
+    return res
+
+
+def set_lvar_type(src, t, vu, is_ptr=False):
+    if isinstance(t, str):
+        tif = idaapi.tinfo_t()
+        if not tif.get_named_type(idaapi.get_idati(), t):
+            print("couldn't convert {} into tinfo_t".format(t))
+            return False
+        if tif:
+            if is_ptr:
+                tif2 = idaapi.tinfo_t()
+                tif2.create_ptr(tif)
+                tif = tif2
+
+            t = tif
+        else:
+            print("couldn't convert {} into tinfo_t".format(t))
+            return False
+
+    if not vu:
+        return False
+    lvars = [n for n in vu.cfunc.lvars if n.name == src]
+    if len(lvars) == 1:
+        print("changing type of {} to {}".format(lvars[0].name, t))
+        return vu.set_lvar_type(lvars[0], t)
+        # return True
+    else:
+        print("couldn't find var {}".format(src))
+    return False
+
+
+def ast_x_until_cot_var_or_cot_num(i):
+    if i.op is idaapi.cot_var:
+        return i.v.getv().name
+
+    if i.op is idaapi.cot_num:
+        return i.n._value
+
+    if not i.x:
+        return i
+
+    return ast_x_until_cot_var_or_cot_num(i.x)
+
+
+def remove_single_trailing_underscore(s):
+    # Remove a single trailing underscore if present
+    if s.endswith("_"):
+        s = s[:-1]
+    return s
+
+
 class CToGMLVisitor(ida_hexrays.ctree_visitor_t):
     """A visitor that makes the hexray pseudo c decompilation output more like the original GML."""
 
-    def __init__(self, cfunc):
+    def __init__(self, cfunc, vu):
+        lvars = cfunc.get_lvars()
+        # print_swig_object_vars(cfunc.body.cblock)
+
+        ptr_tinfo = idaapi.tinfo_t()
+        # print_swig_object_vars(ptr_tinfo)
+
+        # for i in lvars:
+        # print(i.type)
+        # if str(i.type()).startswith("__m1"):
+        # if i.type().is_array():
+        # print(get_ptr_array_tinfo("RValue", i.type().get_array_nelems()))
+        # i.set_lvar_type(
+        # get_ptr_array_tinfo("RValue", i.type().get_array_nelems())
+        # )
+        # else:
+        # i.set_lvar_type(get_tinfo("RValue"))
+        # if self.detect_and_change_type_to_rvalue(i):
+        # self.modified = True
+
         ida_hexrays.ctree_visitor_t.__init__(self, ida_hexrays.CV_INSNS)
 
         self.cfunc = cfunc
+        self.vu = vu
         self.modified = False
+        self.instructions = []
+        self.removed_debug_prolog = False
+        # self.only_once = True
 
-    def visit_insn(self, insn):
-        if self.remove_vector_rvalue_reset_or_free_call(insn):
+        self.detect_and_rename_debug_context_line_number()
+
+        self.simplify_call_method()
+
+        # print_swig_object_vars(cfunc)
+        # lvars = cfunc.get_lvars()
+        # print_swig_object_vars(cfunc.body.cblock)
+        # for i in cfunc.body.cblock:
+        # if self.detect_and_change_type_to_rvalue(i):
+        # self.modified = True
+        # for l in lvars:
+        # print(l.type())
+
+    def visit_insn(self, i):
+        # First instruction cannot be modified. Don't store it so it's not possible to mess with it.
+        if i.index != 0:
+            self.instructions.append(i)
+
+        if self.remove_noisy_function_calls(i):
             return 0
 
-        if self.remove_noisy_function_calls(insn):
+        if self.remove_free_rvalue_if_branches(i):
             return 0
 
-        if self.simplify_rvalue_set_from_function(insn):
+        if self.simplify_rvalue_set_from_function(i):
             return 0
 
-        if self.remove_if_checks_related_to_arg_count(insn):
+        if self.simplify_variable_set_value_direct(i):
+            return 0
+
+        if self.remove_if_checks_related_to_arg_count(i):
+            return 0
+
+        if self.remove_debug_epilog(i):
+            return 0
+
+        if self.detect_and_change_type_to_rvalue(i):
             return 0
 
         return 0
 
-    def simplify_rvalue_set_from_function(self, insn):
-        return False
-
-    def remove_if_checks_related_to_arg_count(self, insn):
+    def detect_and_change_type_to_rvalue(self, i):
         changed = False
 
+        # if (
+        #     i.op is idaapi.cit_expr
+        #     and i.cexpr.op is idaapi.cot_asg
+        #     and i.cexpr.x.op is idaapi.cot_ptr
+        #     and i.cexpr.x.x.op is idaapi.cot_cast
+        #     and i.cexpr.x.x.x.op is idaapi.cot_add
+        #     and i.cexpr.x.x.x.x.op is idaapi.cot_var
+        #     and i.cexpr.x.x.x.y.op is idaapi.cot_num
+        #     and i.cexpr.y.op is idaapi.cot_num
+        #     and i.cexpr.x.x.x.y.n._value == 12
+        # ):
+        if (
+            i.op is idaapi.cit_expr
+            and i.cexpr.op is idaapi.cot_asg
+            and i.cexpr.x.op is idaapi.cot_var
+            and i.cexpr.y.op is idaapi.cot_call
+            and i.cexpr.y.x.op is idaapi.cot_ptr
+            and i.cexpr.y.x.x.op is idaapi.cot_cast
+            and i.cexpr.y.x.x.x.op is idaapi.cot_add
+            and i.cexpr.y.x.x.x.x.op is idaapi.cot_ptr
+            and i.cexpr.y.x.x.x.x.x.op is idaapi.cot_cast
+            and i.cexpr.y.x.x.x.x.x.x.op is idaapi.cot_ref
+            and i.cexpr.y.x.x.x.x.x.x.x.op is idaapi.cot_memptr
+            and i.cexpr.y.x.x.x.x.x.x.x.x.op is idaapi.cot_var
+            and i.cexpr.y.x.x.x.y.op is idaapi.cot_num
+            and i.cexpr.y.a[0].op is idaapi.cot_var
+            and i.cexpr.y.a[1].op is idaapi.cot_cast
+            and i.cexpr.y.a[1].x.op is idaapi.cot_obj
+        ):
+            # if not self.only_once:
+            # return False
+
+            # self.only_once = False
+
+            # print(i.cexpr.x.x.x.x.v.getv().type())
+            # set_lvar_type(i.cexpr.x.x.x.x.v.getv().name, "RValue", self.vu, True)
+            # print(i.cexpr.x.v.getv().name)
+
+            # CRASHES FOR NO REASON, FUCK HEXRAY!
+            # set_lvar_type(i.cexpr.x.v.getv().name, "RValue", self.vu, True)
+
+            changed = True
+
+        return changed
+
+    def detect_and_rename_debug_context_line_number(self):
+        var_ref = None
+        cache_last_values = {}
+
+        for i in self.cfunc.body.cblock:
+            if (
+                i.op is idaapi.cit_expr
+                and i.cexpr.op is idaapi.cot_asg
+                and i.cexpr.x.op is idaapi.cot_var
+                and i.cexpr.y.op is idaapi.cot_num
+                and i.cexpr.x.v
+            ):
+                if i.cexpr.x.v.getv().name not in cache_last_values:
+                    cache_last_values[i.cexpr.x.v.getv().name] = -1
+                if i.cexpr.y.n._value > cache_last_values[i.cexpr.x.v.getv().name]:
+                    cache_last_values[i.cexpr.x.v.getv().name] = i.cexpr.y.n._value
+                    var_ref = i.cexpr.x
+                else:
+                    var_ref = None
+                    break
+
+        if var_ref is not None:
+            # print_swig_object_vars(var_ref.v.getv())
+            self.vu.rename_lvar(var_ref.v.getv(), "debug_context_line_number", 1)
+            self.modified = True
+
+    def simplify_call_method(self):
+        current_index = 0
+
+        def do_the_thing(old_i, instance_name, method_args):
+            method_name = None
+            for k_index in range(current_index - 1, current_index - 10, -1):
+                k = self.cfunc.body.cblock[k_index]
+                if (
+                    k.op is idaapi.cit_expr
+                    and k.cexpr.op is idaapi.cot_call
+                    and k.cexpr.x.op is idaapi.cot_obj
+                    and idaapi.get_name(k.cexpr.x.obj_ea) == "ARRAY_Get"
+                ):
+                    # remove_single_trailing_underscore because
+                    # the ida script that generated the names added _ at end for naming conflict reasons
+                    method_name = remove_single_trailing_underscore(
+                        idaapi.get_name(k.cexpr.a[1].obj_ea)
+                    )
+                    # print(idaapi.get_name(k.cexpr.a[1].obj_ea))
+                    self.remove_instruction(k)
+
+            if method_name is None:
+                return
+
+            old_i.cexpr.replace_by(
+                make_helper_expr(f"{instance_name}.{method_name}({method_args})")
+            )
+            self.modified = True
+
+        for i in self.cfunc.body.cblock:
+            if (
+                # Call_Method(v287, a2, &v289, 0, &v644, 0i64);
+                i.cexpr
+                and i.cexpr.x
+                and idaapi.get_name(i.cexpr.x.obj_ea) == "Call_Method"
+            ):
+                do_the_thing(
+                    i.cexpr,
+                    i.cexpr.a[0].v.getv().name,
+                    ast_x_until_cot_var_or_cot_num(i.cexpr.a[5]),
+                )
+            elif (
+                # v286 = Call_Method(v285, a2, &v290, 2, &v645, &v885.flags);
+                i.op is idaapi.cit_expr
+                and i.cexpr.op is idaapi.cot_asg
+                and i.cexpr.x.op is idaapi.cot_var
+                and i.cexpr.y.op is idaapi.cot_call
+                and i.cexpr.y.x.op is idaapi.cot_obj
+                and idaapi.get_name(i.cexpr.y.x.obj_ea) == "Call_Method"
+            ):
+                # print_swig_object_vars(i.cexpr.y.a[0])
+                do_the_thing(
+                    i.cexpr,
+                    i.cexpr.y.a[0].v.getv().name,
+                    ast_x_until_cot_var_or_cot_num(i.cexpr.y.a[5]),
+                )
+
+            current_index += 1
+
+    def simplify_variable_set_value_direct(self, i):
+        changed = False
+
+        if (
+            i.op is idaapi.cit_expr
+            and i.cexpr.op is idaapi.cot_call
+            and i.cexpr.x.op is idaapi.cot_obj
+            and i.cexpr.a[0].op is idaapi.cot_var
+            and i.cexpr.a[1].op is idaapi.cot_obj
+            and i.cexpr.a[2].op is idaapi.cot_num
+            and i.cexpr.a[3].op is idaapi.cot_cast
+            and i.cexpr.a[3].x.op is idaapi.cot_ref
+            and i.cexpr.a[3].x.x.op is idaapi.cot_var
+        ):
+            print("TODO simplify_variable_set_value_direct")
+            changed = True
+
+        return changed
+
+    def simplify_rvalue_set_from_function(self, i):
+        changed = False
+
+        if (
+            i.op is idaapi.cit_expr
+            and i.cexpr.op is idaapi.cot_asg
+            and i.cexpr.x.op is idaapi.cot_var
+            and i.cexpr.y.op is idaapi.cot_call
+            and i.cexpr.y.x.op is idaapi.cot_obj
+            and idaapi.get_name(i.cexpr.y.x.obj_ea) == "RValue_Set_From_Function"
+        ):
+            print(
+                "TODO simplify_rvalue_set_from_function:"
+                + idaapi.get_name(i.cexpr.y.x.obj_ea)
+            )
+
+        return changed
+
+    def rename_gml_function_if_needed(self, i):
+        if idaapi.get_name(self.cfunc.entry_ea).startswith("sub_") and (
+            i.op is idaapi.cit_expr
+            and i.cexpr.op is idaapi.cot_asg
+            and i.cexpr.x.op is idaapi.cot_idx
+            and i.cexpr.x.x.op is idaapi.cot_var
+            and i.cexpr.x.y.op is idaapi.cot_num
+            and i.cexpr.y.op is idaapi.cot_cast
+            and i.cexpr.y.x.op is idaapi.cot_obj
+        ):
+            pointed_str = idc.get_strlit_contents(i.cexpr.y.x.obj_ea)
+            if pointed_str:
+                pointed_str_utf8 = pointed_str.decode("utf-8")
+                if pointed_str_utf8 and (
+                    pointed_str_utf8.startswith("gml_Script_")
+                    or pointed_str_utf8.startswith("gml_Object_")
+                ):
+                    idaapi.set_name(
+                        self.cfunc.entry_ea,
+                        pointed_str_utf8,
+                        idaapi.SN_FORCE,
+                    )
+
+    def remove_debug_prolog(self):
+        if self.removed_debug_prolog:
+            return False
+
+        for i in self.instructions:
+            self.rename_gml_function_if_needed(i)
+
+            self.remove_instruction(i)
+        self.removed_debug_prolog = True
+
+        return True
+
+    def remove_debug_epilog(self, i):
+        changed = False
+
+        if (
+            i.op is idaapi.cit_expr
+            and i.cexpr.op is idaapi.cot_asg
+            and i.cexpr.x.op is idaapi.cot_ptr
+            and i.cexpr.x.x.op is idaapi.cot_cast
+            and i.cexpr.x.x.x.op is idaapi.cot_obj
+            and i.cexpr.y.op is idaapi.cot_idx
+            and i.cexpr.y.x.op is idaapi.cot_var
+            and i.cexpr.y.y.op is idaapi.cot_num
+            and idaapi.get_name(i.cexpr.x.x.x.obj_ea) == "SYYStackTrace::s_pStart"
+        ):
+            self.remove_instruction(i)
+            changed = True
+
+        if (
+            i.op is idaapi.cit_expr
+            and i.cexpr.op is idaapi.cot_asg
+            and i.cexpr.x.op is idaapi.cot_obj
+            and i.cexpr.y.op is idaapi.cot_var
+            and idaapi.get_name(i.cexpr.x.obj_ea) == "g_CurrentArrayOwner"
+        ):
+            self.remove_instruction(i)
+            changed = True
+
+        if (
+            i.op is idaapi.cit_expr
+            and i.cexpr.op is idaapi.cot_asg
+            and i.cexpr.x.op is idaapi.cot_obj
+            and i.cexpr.y.op is idaapi.cot_cast
+            and i.cexpr.y.x.op is idaapi.cot_var
+            and idaapi.get_name(i.cexpr.x.obj_ea) == "g_CurrentArrayOwner"
+        ):
+            self.remove_debug_prolog()
+            changed = True
+
+        return changed
+
+    def remove_if_checks_related_to_arg_count(self, i):
+        changed = False
+
+        # if ( arg_count <= 2 )
+        #     some_local_var = &rvalue_array;
+        #   else
+        #     some_local_var = *(args + 2);
         try:
-            if insn.op == ida_hexrays.cit_if:
-                if_stmt = insn.cif
+            if i.op == ida_hexrays.cit_if:
+                if_stmt = i.cif
                 then_branch = if_stmt.ithen
                 else_branch = if_stmt.ielse
 
                 if (
                     then_branch
                     and else_branch
-                    # if ( v11 <= 2 )
-                    #     v16 = &rvalue_array;
-                    #   else
-                    #     v16 = *(v10 + 2);
                     and idaapi.get_name(then_branch.cblock[0].cexpr.y.x.obj_ea)
                     == "rvalue_array"
                 ):
                     # print_swig_object_vars(then_branch.cblock[0].cexpr.y.x)
                     # print(idaapi.get_name(then_branch.cblock[0].cexpr.y.x.obj_ea))
-                    insn.replace_by(if_stmt.ielse)
+                    i.replace_by(if_stmt.ielse)
                     changed = True
+        except Exception as _:
+            pass
+
+        # if ( arg_count <= 2 )
+        #     some_local_var = *args
+        try:
+            if i.op == ida_hexrays.cit_if:
+                if_stmt = i.cif
+                then_branch = if_stmt.ithen
+                if (
+                    then_branch
+                    and then_branch.cblock[0].cexpr.y.x.v.getv()
+                    == self.cfunc.arguments[4]
+                ):
+                    i.replace_by(if_stmt.ithen)
+                    changed = True
+        except Exception as _:
+            pass
+
+        # some_local_var = &rvalue_array;
+        try:
+            if (
+                i.op is idaapi.cit_expr
+                and i.cexpr.op is idaapi.cot_asg
+                and i.cexpr.x.op is idaapi.cot_var
+                and i.cexpr.y.op is idaapi.cot_ref
+                and i.cexpr.y.x.op is idaapi.cot_obj
+                and idaapi.get_name(i.cexpr.y.x.obj_ea) == "rvalue_array"
+            ):
+                i.replace_by(create_dummy_hexrays_insn())
+                changed = True
         except Exception as _:
             pass
 
         return changed
 
-    def remove_insn(self, insn):
-        insn.cleanup()
-        insn.replace_by(create_dummy_hexrays_insn())
+    def remove_instruction(self, inin):
+        inin.cleanup()
+        inin.replace_by(create_dummy_hexrays_insn())
 
         self.modified = True
 
-    def remove_vector_rvalue_reset_or_free_call(self, insn):
-        if insn.cexpr and idaapi.get_name(insn.cexpr.x.obj_ea) in [
-            "vector_constructor_iterator",
-            "??_L@YAXPEAX_K1P6AX0@Z2@Z",  # mangled equivalent of the above
-            "vector_destructor_iterator",
-            "??_M@YAXPEAX_K1P6AX0@Z@Z",  # mangled equivalent of the above
-        ]:
-            self.remove_insn(insn)
+    def remove_noisy_function_calls(self, i):
+        if (
+            i.cexpr
+            and i.cexpr.x
+            and idaapi.get_name(i.cexpr.x.obj_ea)
+            in [
+                "noisy_set_stracktrace",
+                "noisy_set_array_owner",
+                "RValue_Free",
+                "PushContextStack",
+                "PopContextStack",
+                "RValue_Reset",
+            ]
+        ):
+            self.remove_instruction(i)
+            return True
+
+        if (
+            i.cexpr
+            and i.cexpr.x
+            and idaapi.get_name(i.cexpr.x.obj_ea)
+            in [
+                "vector_constructor_iterator",
+                "??_L@YAXPEAX_K1P6AX0@Z2@Z",  # mangled equivalent of the above
+                "vector_destructor_iterator",
+                "??_M@YAXPEAX_K1P6AX0@Z@Z",  # mangled equivalent of the above
+            ]
+        ):
+            self.remove_debug_prolog()
+
+            self.remove_instruction(i)
             return True
 
         return False
 
-    def remove_noisy_function_calls(self, insn):
+    def remove_free_rvalue_if_branches(self, i):
         changed = False
 
-        if insn.op == ida_hexrays.cit_if:
-            if_statement = insn.cif
+        if i.op == ida_hexrays.cit_if:
+            if_statement = i.cif
             if_body = if_statement.ithen
 
             instruction_count_inside_block = len(if_body.cblock)
@@ -302,12 +743,12 @@ class CToGMLVisitor(ida_hexrays.ctree_visitor_t):
                         # print(idaapi.get_name(expr.x.obj_ea))
                         func_name = idaapi.get_name(expr.x.obj_ea)
                         if func_name == "FREE_RValue_Pre":
-                            self.remove_insn(stmt)
+                            self.remove_instruction(stmt)
                             instruction_count_inside_block -= 1
                             changed = True
 
             if instruction_count_inside_block <= 0:
-                self.remove_insn(insn)
+                self.remove_instruction(i)
 
         return changed
 
@@ -317,7 +758,7 @@ def clean_gml_decompilation():
 
     # DebugVisitor().apply_to(vu.cfunc.body, None)
     # return
-    v = CToGMLVisitor(vu.cfunc)
+    v = CToGMLVisitor(vu.cfunc, vu)
     v.apply_to(vu.cfunc.body, None)
 
     # If any modifications were made, refresh the decompilation view
