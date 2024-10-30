@@ -302,10 +302,13 @@ def ast_x_until_cot_var_or_cot_num(i):
     return ast_x_until_cot_var_or_cot_num(i.x)
 
 
-def remove_single_trailing_underscore(s):
-    # Remove a single trailing underscore if present
+def remove_underscores(s):
+    if s.startswith("_"):
+        s = s[1:]
+
     if s.endswith("_"):
         s = s[:-1]
+
     return s
 
 
@@ -313,10 +316,10 @@ class CToGMLVisitor(ida_hexrays.ctree_visitor_t):
     """A visitor that makes the hexray pseudo c decompilation output more like the original GML."""
 
     def __init__(self, cfunc, vu):
-        lvars = cfunc.get_lvars()
+        # lvars = cfunc.get_lvars()
         # print_swig_object_vars(cfunc.body.cblock)
 
-        ptr_tinfo = idaapi.tinfo_t()
+        # ptr_tinfo = idaapi.tinfo_t()
         # print_swig_object_vars(ptr_tinfo)
 
         # for i in lvars:
@@ -341,10 +344,6 @@ class CToGMLVisitor(ida_hexrays.ctree_visitor_t):
         self.removed_debug_prolog = False
         # self.only_once = True
 
-        self.detect_and_rename_debug_context_line_number()
-
-        self.simplify_call_method()
-
         # print_swig_object_vars(cfunc)
         # lvars = cfunc.get_lvars()
         # print_swig_object_vars(cfunc.body.cblock)
@@ -353,6 +352,19 @@ class CToGMLVisitor(ida_hexrays.ctree_visitor_t):
         # self.modified = True
         # for l in lvars:
         # print(l.type())
+
+    def do_passes(self):
+        self.apply_to(self.vu.cfunc.body, None)
+
+        self.second_pass()
+
+    def second_pass(self):
+        """At this point all instructions are inside self.instructions"""
+        self.detect_and_rename_debug_context_line_number()
+
+        self.simplify_call_method()
+
+        self.simplify_array_get()
 
     def visit_insn(self, i):
         # First instruction cannot be modified. Don't store it so it's not possible to mess with it.
@@ -434,7 +446,7 @@ class CToGMLVisitor(ida_hexrays.ctree_visitor_t):
         var_ref = None
         cache_last_values = {}
 
-        for i in self.cfunc.body.cblock:
+        for i in self.instructions:
             if (
                 i.op is idaapi.cit_expr
                 and i.cexpr.op is idaapi.cot_asg
@@ -453,25 +465,23 @@ class CToGMLVisitor(ida_hexrays.ctree_visitor_t):
 
         if var_ref is not None:
             # print_swig_object_vars(var_ref.v.getv())
-            self.vu.rename_lvar(var_ref.v.getv(), "debug_context_line_number", 1)
+            self.vu.rename_lvar(var_ref.v.getv(), "gml_debug_context_line_number", 1)
             self.modified = True
 
     def simplify_call_method(self):
         current_index = 0
 
-        def do_the_thing(old_i, instance_name, method_args):
+        def find_the_array_get_call_and_do_simplify(old_i, instance_name, method_args):
             method_name = None
             for k_index in range(current_index - 1, current_index - 10, -1):
-                k = self.cfunc.body.cblock[k_index]
+                k = self.instructions[k_index]
                 if (
                     k.op is idaapi.cit_expr
                     and k.cexpr.op is idaapi.cot_call
                     and k.cexpr.x.op is idaapi.cot_obj
-                    and idaapi.get_name(k.cexpr.x.obj_ea) == "ARRAY_Get"
+                    and "ARRAY_Get" in idaapi.get_name(k.cexpr.x.obj_ea)
                 ):
-                    # remove_single_trailing_underscore because
-                    # the ida script that generated the names added _ at end for naming conflict reasons
-                    method_name = remove_single_trailing_underscore(
+                    method_name = remove_underscores(
                         idaapi.get_name(k.cexpr.a[1].obj_ea)
                     )
                     # print(idaapi.get_name(k.cexpr.a[1].obj_ea))
@@ -485,16 +495,18 @@ class CToGMLVisitor(ida_hexrays.ctree_visitor_t):
             )
             self.modified = True
 
-        for i in self.cfunc.body.cblock:
+        for i in self.instructions:
+            # if i.cexpr and i.cexpr.x:
+            # print(idaapi.get_name(i.cexpr.x.obj_ea) + " + " + hex(i.ea))
             if (
                 # Call_Method(v287, a2, &v289, 0, &v644, 0i64);
                 i.cexpr
                 and i.cexpr.x
                 and idaapi.get_name(i.cexpr.x.obj_ea) == "Call_Method"
             ):
-                do_the_thing(
+                find_the_array_get_call_and_do_simplify(
                     i.cexpr,
-                    i.cexpr.a[0].v.getv().name,
+                    ast_x_until_cot_var_or_cot_num(i.cexpr.a[0]),
                     ast_x_until_cot_var_or_cot_num(i.cexpr.a[5]),
                 )
             elif (
@@ -507,13 +519,28 @@ class CToGMLVisitor(ida_hexrays.ctree_visitor_t):
                 and idaapi.get_name(i.cexpr.y.x.obj_ea) == "Call_Method"
             ):
                 # print_swig_object_vars(i.cexpr.y.a[0])
-                do_the_thing(
+                find_the_array_get_call_and_do_simplify(
                     i.cexpr,
-                    i.cexpr.y.a[0].v.getv().name,
+                    ast_x_until_cot_var_or_cot_num(i.cexpr.y.a[0]),
                     ast_x_until_cot_var_or_cot_num(i.cexpr.y.a[5]),
                 )
 
             current_index += 1
+
+    def simplify_array_get(self):
+        for i in self.instructions:
+            if (
+                # ARRAY_Get(self, undefined_, 0x80000000, &v18);
+                i.cexpr
+                and i.cexpr.x
+                and "ARRAY_Get" in idaapi.get_name(i.cexpr.x.obj_ea)
+            ):
+                field_name = remove_underscores(idaapi.get_name(i.cexpr.a[1].obj_ea))
+                i.cexpr.replace_by(
+                    make_helper_expr(
+                        f"{ast_x_until_cot_var_or_cot_num(i.cexpr.a[3])} = {ast_x_until_cot_var_or_cot_num(i.cexpr.a[0])}.{field_name}"
+                    )
+                )
 
     def simplify_variable_set_value_direct(self, i):
         changed = False
@@ -522,14 +549,15 @@ class CToGMLVisitor(ida_hexrays.ctree_visitor_t):
             i.op is idaapi.cit_expr
             and i.cexpr.op is idaapi.cot_call
             and i.cexpr.x.op is idaapi.cot_obj
-            and i.cexpr.a[0].op is idaapi.cot_var
-            and i.cexpr.a[1].op is idaapi.cot_obj
-            and i.cexpr.a[2].op is idaapi.cot_num
-            and i.cexpr.a[3].op is idaapi.cot_cast
-            and i.cexpr.a[3].x.op is idaapi.cot_ref
-            and i.cexpr.a[3].x.x.op is idaapi.cot_var
+            and idaapi.get_name(i.cexpr.x.obj_ea) == "Variable_SetValue_Direct"
         ):
-            print("TODO simplify_variable_set_value_direct")
+            field_name = remove_underscores(idaapi.get_name(i.cexpr.a[1].obj_ea))
+            i.cexpr.replace_by(
+                make_helper_expr(
+                    f"{i.cexpr.a[0].v.getv().name}.{field_name} = {ast_x_until_cot_var_or_cot_num(i.cexpr.a[3])}"
+                )
+            )
+
             changed = True
 
         return changed
@@ -545,9 +573,11 @@ class CToGMLVisitor(ida_hexrays.ctree_visitor_t):
             and i.cexpr.y.x.op is idaapi.cot_obj
             and idaapi.get_name(i.cexpr.y.x.obj_ea) == "RValue_Set_From_Function"
         ):
-            print(
-                "TODO simplify_rvalue_set_from_function:"
-                + idaapi.get_name(i.cexpr.y.x.obj_ea)
+            func_name = remove_underscores(idaapi.get_name(i.cexpr.y.a[4].obj_ea))
+            i.cexpr.replace_by(
+                make_helper_expr(
+                    f"{ast_x_until_cot_var_or_cot_num(i.cexpr.x)} = {func_name}({ast_x_until_cot_var_or_cot_num(i.cexpr.y.a[5])})"
+                )
             )
 
         return changed
@@ -608,7 +638,7 @@ class CToGMLVisitor(ida_hexrays.ctree_visitor_t):
             i.op is idaapi.cit_expr
             and i.cexpr.op is idaapi.cot_asg
             and i.cexpr.x.op is idaapi.cot_obj
-            and i.cexpr.y.op is idaapi.cot_var
+            and (i.cexpr.y.op is idaapi.cot_var or i.cexpr.y.op is idaapi.cot_num)
             and idaapi.get_name(i.cexpr.x.obj_ea) == "g_CurrentArrayOwner"
         ):
             self.remove_instruction(i)
@@ -759,7 +789,7 @@ def clean_gml_decompilation():
     # DebugVisitor().apply_to(vu.cfunc.body, None)
     # return
     v = CToGMLVisitor(vu.cfunc, vu)
-    v.apply_to(vu.cfunc.body, None)
+    v.do_passes()
 
     # If any modifications were made, refresh the decompilation view
     if v.modified:
